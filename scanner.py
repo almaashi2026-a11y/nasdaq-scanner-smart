@@ -135,4 +135,4 @@ if start_scan or auto_refresh:
 
     progress = st.progress(0, text="⏳ جاري فحص الأسهم...")
 
-    for i, ticker in enumerate
+    for i, ticker in enumerate:
