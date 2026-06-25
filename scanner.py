@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
+import os
 
 st.set_page_config(
     page_title="سكنر ناسداك الاحترافي",
@@ -10,12 +11,17 @@ st.set_page_config(
 )
 
 # =============================================================================
-# ⚙️ ضع بياناتك هنا فقط
+# ⚙️ المفاتيح تُقرأ من Environment Variables في Render (Settings → Environment)
 # =============================================================================
 
-FINNHUB_KEY      = "d8qksm9r01qrf6e1smhgd8qksm9r01qrf6e1smi0"
-TELEGRAM_TOKEN   = "AAHPItwA0XX6N2kODJrvyegIkzkkC0Mph3k"
-TELEGRAM_CHAT_ID = "8524780143"
+FINNHUB_KEY      = os.environ.get("FINNHUB_KEY")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# تحقق سريع: لو أي مفتاح ناقص، نوقف التطبيق برسالة واضحة بدل خطأ غامض
+if not all([FINNHUB_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+    st.error("⚠️ تأكد من إضافة FINNHUB_KEY و TELEGRAM_TOKEN و TELEGRAM_CHAT_ID في Render → Settings → Environment")
+    st.stop()
 
 # =============================================================================
 # 📡 جلب البيانات
