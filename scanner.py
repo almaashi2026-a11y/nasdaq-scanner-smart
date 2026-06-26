@@ -4,10 +4,11 @@ import pandas as pd
 import time
 import os
 import json
+import threading
 
 st.set_page_config(
-    page_title="رادار التجميع المؤسسي",
-    page_icon="🏦",
+    page_title="رادار البمب اللحظي",
+    page_icon="🚀",
     layout="wide",
 )
 
@@ -48,6 +49,20 @@ def save_data(data):
             json.dump(data, f)
     except Exception:
         pass
+
+# قفل عالمي يمنع تشغيل دورتين فحص في نفس الوقت (مهم عند تداخل زيارات Cron)
+SCAN_LOCK_FILE = "scan.lock"
+
+def is_scan_running():
+    return os.path.exists(SCAN_LOCK_FILE)
+
+def set_scan_lock(running):
+    if running:
+        with open(SCAN_LOCK_FILE, "w") as f:
+            f.write(str(time.time()))
+    else:
+        if os.path.exists(SCAN_LOCK_FILE):
+            os.remove(SCAN_LOCK_FILE)
 
 # =============================================================================
 # 📡 جلب البيانات
@@ -94,13 +109,19 @@ def update_volume_history(data, ticker, current_volume):
     return avg_volume
 
 # =============================================================================
-# 🎯 رصد دخول المال المؤسسي (منهجية Wyckoff / Volume Spread Analysis)
+# 🚀 رصد البمب اللحظي (Momentum Breakout)
 # =============================================================================
-# المبدأ: المؤسسات تجمّع بهدوء — حجم تداول مرتفع جداً مع حركة سعرية محدودة
-# (ضيقة)، وإغلاق قريب من أعلى نطاق اليوم.
+# المبدأ: بمب حقيقي = تغيير سعري كبير + فوليوم عالي جداً يدعم الحركة
+# (مايكون وهمي/ضعيف). كل ما زاد التغيير % والفوليوم معًا، زاد السكور.
 # =============================================================================
 
-def evaluate_stock(price, volume, avg_volume, day_high, day_low):
+def calculate_vwap_approx(day_open, day_high, day_low, price):
+    if day_open <= 0 or day_high <= 0 or day_low <= 0:
+        return None
+    return (day_open + day_high + day_low + price) / 4
+
+
+def evaluate_stock(price, volume, avg_volume, day_high, day_low, day_open, change_pct):
     score = 0
     signals = []
 
@@ -111,43 +132,63 @@ def evaluate_stock(price, volume, avg_volume, day_high, day_low):
 
     rvol = volume / avg_volume
 
-    if rvol < 2:
-        return 0, [f"😴 لا تجميع (RVOL {rvol:.1f}x)"]
+    # ── الشرط الأساسي: تغيير سعري ملموس (بدونه ماعندنا بمب أصلاً) ───────
+    if change_pct < 5:
+        return 0, [f"😴 لا حركة كافية ({change_pct:+.1f}%)"]
 
-    if rvol > 5:
-        score += 50
-        signals.append(f"🏦 فوليوم استثنائي ({rvol:.1f}x)")
-    elif rvol > 3:
+    # ── الشرط الثاني: فوليوم يدعم الحركة (بمب بدون فوليوم = وهمي) ───────
+    if rvol < 1.5:
+        return 0, [f"⚠️ بمب بدون فوليوم داعم (RVOL {rvol:.1f}x)"]
+
+    # ── نقاط التغيير السعري (الوزن الأكبر — أساس البمب) ─────────────────
+    if change_pct > 30:
+        score += 45
+        signals.append(f"🚀 بمب ضخم ({change_pct:+.1f}%)")
+    elif change_pct > 15:
         score += 35
-        signals.append(f"🏦 فوليوم قوي ({rvol:.1f}x)")
+        signals.append(f"🚀 بمب قوي ({change_pct:+.1f}%)")
+    elif change_pct > 8:
+        score += 25
+        signals.append(f"📈 بمب متوسط ({change_pct:+.1f}%)")
     else:
-        score += 20
-        signals.append(f"🏦 فوليوم مرتفع ({rvol:.1f}x)")
+        score += 15
+        signals.append(f"📈 حركة صاعدة ({change_pct:+.1f}%)")
 
-    if day_high > day_low and day_high > 0:
-        day_range_pct = ((day_high - day_low) / day_high) * 100
-        if day_range_pct < 3:
-            score += 30
-            signals.append("🔇 مدى ضيق جداً (استيعاب هادئ)")
-        elif day_range_pct < 6:
-            score += 20
-            signals.append("🔉 مدى ضيق (تجميع محتمل)")
-        elif day_range_pct < 12:
-            score += 5
-            signals.append("📊 مدى متوسط")
-        else:
-            signals.append("📈 مدى واسع (حركة مضاربية)")
+    # ── نقاط الفوليوم الداعم ──────────────────────────────────────────
+    if rvol > 5:
+        score += 35
+        signals.append(f"🔥 فوليوم استثنائي ({rvol:.1f}x)")
+    elif rvol > 3:
+        score += 25
+        signals.append(f"🔥 فوليوم قوي ({rvol:.1f}x)")
+    elif rvol > 2:
+        score += 15
+        signals.append(f"📊 فوليوم مرتفع ({rvol:.1f}x)")
+    else:
+        score += 5
+        signals.append(f"📊 فوليوم مقبول ({rvol:.1f}x)")
 
+    # ── موقع الإغلاق داخل نطاق اليوم: قريب من القمة = استمرارية محتملة ──
     if day_high > day_low:
         close_position = (price - day_low) / (day_high - day_low)
         if close_position > 0.75:
-            score += 20
+            score += 15
             signals.append("💪 إغلاق قوي قرب القمة")
         elif close_position > 0.5:
-            score += 10
+            score += 8
             signals.append("➡️ إغلاق متوسط")
         else:
-            signals.append("⚠️ إغلاق ضعيف")
+            signals.append("⚠️ إغلاق ضعيف (تراجع من القمة)")
+
+    # ── اختراق VWAP التقريبي (تأكيد إضافي على قوة الحركة) ────────────────
+    vwap = calculate_vwap_approx(day_open, day_high, day_low, price)
+    if vwap is not None and vwap > 0:
+        vwap_distance_pct = ((price - vwap) / vwap) * 100
+        if vwap_distance_pct > 0.5:
+            score += 5
+            signals.append(f"🎯 فوق VWAP ({vwap_distance_pct:+.1f}%)")
+        else:
+            signals.append(f"↔️ تحت/عند VWAP ({vwap_distance_pct:+.1f}%)")
 
     return score, signals
 
@@ -156,67 +197,93 @@ def evaluate_stock(price, volume, avg_volume, day_high, day_low):
 # =============================================================================
 
 def run_scan(min_price, max_price, min_score, telegram_enabled, progress_callback=None):
-    data = load_data()
-    tickers = get_nasdaq_tickers()
-    total = len(tickers)
+    set_scan_lock(True)
+    try:
+        data = load_data()
+        tickers = get_nasdaq_tickers()
+        total = len(tickers)
 
-    results = []
-    alerted_tickers = set(data.get("alerted_tickers", []))
+        results = []
+        alerted_tickers = set(data.get("alerted_tickers", []))
 
-    for i, ticker in enumerate(tickers):
-        if progress_callback:
-            progress_callback(i, total, ticker)
+        for i, ticker in enumerate(tickers):
+            if progress_callback:
+                progress_callback(i, total, ticker)
 
-        try:
-            quote = get_quote(ticker)
+            try:
+                quote = get_quote(ticker)
 
-            price = quote.get("c", 0)
-            day_high = quote.get("h", 0)
-            day_low = quote.get("l", 0)
-            prev_close = quote.get("pc", 0)
+                price = quote.get("c", 0)
+                day_high = quote.get("h", 0)
+                day_low = quote.get("l", 0)
+                day_open = quote.get("o", 0)
+                prev_close = quote.get("pc", 0)
 
-            if price < min_price or price > max_price or price == 0:
+                if price < min_price or price > max_price or price == 0:
+                    continue
+
+                change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0
+
+                volume = quote.get("v", 0) if "v" in quote else 0
+                avg_volume = update_volume_history(data, ticker, volume)
+
+                score, signals = evaluate_stock(price, volume, avg_volume, day_high, day_low, day_open, change_pct)
+
+                if score >= min_score:
+                    results.append({
+                        "السهم": ticker,
+                        "السعر": round(price, 3),
+                        "التغيير %": round(change_pct, 2),
+                        "التقييم": score,
+                        "الإشارات": " | ".join(signals),
+                    })
+
+                    if telegram_enabled and ticker not in alerted_tickers:
+                        msg = (
+                            f"🚀 <b>بمب محتمل: {ticker}</b>\n"
+                            f"السعر: ${price}\n"
+                            f"التغيير: {change_pct:+.2f}%\n"
+                            f"التقييم: {score}/100\n"
+                            f"الإشارات: {' | '.join(signals)}"
+                        )
+                        send_telegram(msg)
+                        alerted_tickers.add(ticker)
+
+            except Exception:
                 continue
 
-            change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0
+            # حفظ تقدمي كل 200 سهم — لو الفحص انقطع بسكون السيرفر، آخر حفظ يبقى موجود
+            if i % 200 == 0:
+                save_data(data)
 
-            volume = quote.get("v", 0) if "v" in quote else 0
-            avg_volume = update_volume_history(data, ticker, volume)
+        results = sorted(results, key=lambda x: x["التقييم"], reverse=True)
 
-            score, signals = evaluate_stock(price, volume, avg_volume, day_high, day_low)
+        data["alerted_tickers"] = list(alerted_tickers)
+        data["scan_runs"] = data.get("scan_runs", 0) + 1
+        data["last_results"] = results
+        data["last_scan_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        data["last_total_scanned"] = total
+        save_data(data)
 
-            if score >= min_score:
-                results.append({
-                    "السهم": ticker,
-                    "السعر": round(price, 3),
-                    "التغيير %": round(change_pct, 2),
-                    "التقييم": score,
-                    "الإشارات": " | ".join(signals),
-                })
+        return results, total, data["scan_runs"]
+    finally:
+        set_scan_lock(False)
 
-                if telegram_enabled and ticker not in alerted_tickers:
-                    msg = (
-                        f"🏦 <b>دخول مال مؤسسي محتمل: {ticker}</b>\n"
-                        f"السعر: ${price}\n"
-                        f"تقييم التجميع: {score}/100\n"
-                        f"الإشارات: {' | '.join(signals)}"
-                    )
-                    send_telegram(msg)
-                    alerted_tickers.add(ticker)
 
+def run_scan_background(min_price, max_price, min_score, telegram_enabled):
+    """يشغّل run_scan في ثريد مستقل بدون حجب الطلب الحالي (يرجع فورًا)."""
+    if is_scan_running():
+        return False  # فيه دورة شغالة فعلاً، لا نبدأ دورة ثانية فوقها
+
+    def _worker():
+        try:
+            run_scan(min_price, max_price, min_score, telegram_enabled)
         except Exception:
-            continue
+            set_scan_lock(False)
 
-    results = sorted(results, key=lambda x: x["التقييم"], reverse=True)
-
-    data["alerted_tickers"] = list(alerted_tickers)
-    data["scan_runs"] = data.get("scan_runs", 0) + 1
-    data["last_results"] = results
-    data["last_scan_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    data["last_total_scanned"] = total
-    save_data(data)
-
-    return results, total, data["scan_runs"]
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return True
 
 # =============================================================================
 # 🤖 وضع الفحص التلقائي (لاستدعاء Cron خارجي بدون واجهة)
@@ -226,22 +293,27 @@ def run_scan(min_price, max_price, min_score, telegram_enabled, progress_callbac
 query_params = st.query_params
 
 if query_params.get("autoscan") == "1":
-    # تشغيل فحص كامل بإعدادات افتراضية وإرسال تنبيهات تيليغرام تلقائيًا
-    results, total, scan_runs = run_scan(
-        min_price=0.20,
-        max_price=10.0,
-        min_score=50,
-        telegram_enabled=True,
-    )
-    st.success(f"✅ فحص تلقائي اكتمل — {len(results)} سهم مطابق من {total} (دورة #{scan_runs})")
+    if is_scan_running():
+        st.info("⏳ فيه دورة فحص شغّالة فعلاً من نداء سابق — هذا النداء يُتجاهل لمنع التضارب.")
+    else:
+        started = run_scan_background(
+            min_price=0.20,
+            max_price=10.0,
+            min_score=50,
+            telegram_enabled=True,
+        )
+        if started:
+            st.success("🚀 بدأ فحص جديد بالخلفية. التنبيهات ستُرسل لتيليغرام تلقائيًا عند اكتشاف بمب.")
+        else:
+            st.info("⏳ فيه دورة فحص شغّالة فعلاً.")
     st.stop()
 
 # =============================================================================
 # 🖥️ الواجهة العادية (للزيارة اليدوية)
 # =============================================================================
 
-st.markdown("## 🏦 رادار التجميع المؤسسي")
-st.caption("يرصد دخول المال المؤسسي عبر فوليوم استثنائي + مدى ضيق + إغلاق قوي (منهجية Wyckoff)")
+st.markdown("## 🚀 رادار البمب اللحظي")
+st.caption("يرصد الأسهم اللي تحرك سعرها بقوة مع فوليوم يدعم الحركة (تغيير % كبير + RVOL عالي)")
 st.divider()
 
 saved_data = load_data()
@@ -260,14 +332,14 @@ with st.sidebar:
     scan_runs = saved_data.get("scan_runs", 0)
     st.caption(f"📊 دورات السكان المنفذة: {scan_runs}")
     if scan_runs < 3:
-        st.caption("⏳ السكنر يحتاج 3 دورات على الأقل (يدوي أو تلقائي) عشان التجميع يظهر بدقة")
+        st.caption("⏳ السكنر يحتاج 3 دورات على الأقل (يدوي أو تلقائي) عشان حساب RVOL يصير دقيق")
     else:
-        st.caption("✅ تاريخ الفوليوم كافي — إشارة التجميع نشطة")
+        st.caption("✅ تاريخ الفوليوم كافي — كشف البمب نشط بدقة")
 
     st.divider()
     st.markdown("### 🤖 الفحص التلقائي (بدون فتح الجوال)")
-    st.caption("اربط هذا الرابط بخدمة مجانية مثل cron-job.org تناديه كل 5-10 دقائق:")
-    st.code(f"{st.context.headers.get('host', 'your-app.onrender.com') if hasattr(st, 'context') else 'your-app.onrender.com'}/?autoscan=1", language=None)
+    st.caption("اربط رابط موقعك + `/?autoscan=1` بخدمة مجانية مثل cron-job.org، واجعلها تناديه كل 5-10 دقائق. مثال:")
+    st.code("https://nasdaq-scanner-smart-6nji.onrender.com/?autoscan=1", language=None)
 
 col1, col2, col3, col4 = st.columns(4)
 kpi1, kpi2, kpi3, kpi4 = col1.empty(), col2.empty(), col3.empty(), col4.empty()
